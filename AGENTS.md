@@ -7,7 +7,7 @@ This file provides context for AI agents working in this repository.
 - **Project**: twitter-cli — A CLI for Twitter/X (read timelines, bookmarks, search, post, reply, etc.)
 - **Language**: Python 3.10+
 - **Package Manager**: uv (recommended) / pip
-- **Repository**: https://github.com/jackwener/twitter-cli
+- **Repository**: https://github.com/joelezra/twitter-cli
 
 ## Build, Lint, and Test Commands
 

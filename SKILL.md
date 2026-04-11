@@ -1,14 +1,15 @@
 ---
 name: twitter-cli
-description: Use twitter-cli for ALL Twitter/X operations — reading tweets, posting, replying, quoting, liking, retweeting, following, searching, user lookups. Invoke whenever user requests any Twitter interaction.
-author: jackwener
-version: "0.8.0"
+description: Use twitter-cli for ALL Twitter/X operations — reading tweets, posting, replying, quoting, liking, retweeting, following, searching, user lookups. Invoke whenever user requests any Twitter interaction. Integrates with NanoClaw as a container skill.
+author: joelezra
+version: "0.8.6"
 tags:
   - twitter
   - x
   - social-media
   - terminal
   - cli
+  - nanoclaw
 ---
 
 # twitter-cli — Twitter/X CLI Tool
@@ -169,6 +170,11 @@ twitter tweet https://x.com/user/status/12345  # Accepts URL
 twitter show 2                         # Open tweet #2 from last feed/search list
 twitter show 2 --full-text             # Full text in reply table
 twitter show 2 --json                  # Structured output
+twitter article 1234567890             # Fetch article by tweet ID
+twitter article 1234567890 --markdown  # Output as Markdown
+twitter article 1234567890 -o art.md   # Save to file
+twitter article https://x.com/i/article/1234567890  # Accepts /i/article/ URLs (resolves automatically)
+twitter article https://x.com/user/article/1234567890 --json  # Accepts user article URLs
 twitter list 1539453138322673664       # List timeline
 twitter list 1539453138322673664 --full-text
 twitter user-posts elonmusk --max 20   # User's tweets
@@ -224,6 +230,22 @@ twitter post "Check this out!" --image /path/to/photo.jpg
 
 # Multiple images
 twitter post "Photo gallery" -i img1.png -i img2.jpg -i img3.webp
+```
+
+### Fetch a Twitter Article
+
+```bash
+# By tweet ID or tweet URL (direct fetch)
+twitter article 1234567890 --markdown
+
+# By standalone article URL (/i/article/<id>) — auto-resolves to parent tweet
+twitter article https://x.com/i/article/1234567890 --markdown
+
+# Save article to file
+twitter article 1234567890 --output article.md
+
+# Structured output for processing
+twitter article 1234567890 --json
 ```
 
 ### Reply to someone's latest tweet
@@ -344,3 +366,37 @@ twitter bookmarks --filter
 - Do not ask users to share raw cookie values in chat logs.
 - Prefer local browser cookie extraction over manual secret copy/paste.
 - Agent should treat cookie values as secrets (do not echo to stdout unnecessarily).
+
+## NanoClaw Integration
+
+twitter-cli works as a [NanoClaw](https://github.com/qwibitai/nanoclaw) container skill. To add it to your NanoClaw instance:
+
+### As a Container Skill (Recommended)
+
+1. **Install in container** — add `RUN uv tool install twitter-cli` to `container/Dockerfile`
+2. **Set credentials** — add `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` to your credential store (OneCLI or `.env`)
+3. **Create skill file** — add `container/skills/twitter/SKILL.md` with the command reference above
+4. **Rebuild** — run `./container/build.sh`
+
+The agent inside the container will automatically discover the skill and use twitter-cli for X/Twitter tasks.
+
+### As a Host-Side Feature Skill (Advanced)
+
+For Playwright-based browser automation (better anti-detection for write operations), see the [x-integration skill](https://github.com/qwibitai/nanoclaw) which uses NanoClaw's IPC pattern.
+
+### Skill Directory Structure
+
+```
+# Container skill (simple — CLI runs inside container)
+container/skills/twitter/
+└── SKILL.md
+
+# Feature skill (advanced — host-side IPC)
+.claude/skills/add-twitter-cli/
+├── SKILL.md          # Setup instructions (merge branch, configure)
+├── agent.ts          # Container-side MCP tool definitions
+├── host.ts           # Host-side IPC handler
+└── scripts/          # Host-side automation scripts
+```
+
+See [NanoClaw CONTRIBUTING.md](https://github.com/qwibitai/nanoclaw/blob/main/CONTRIBUTING.md) for the full skill taxonomy.
