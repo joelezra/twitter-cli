@@ -12,7 +12,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any, Callable, Dict, List, Optional, Tuple  # noqa: F401
 
-from .models import Author, Metrics, Tweet, TweetMedia, UserProfile
+from .models import (
+    Author,
+    DMConversation,
+    DMMessage,
+    DMParticipant,
+    Metrics,
+    Trend,
+    Tweet,
+    TweetMedia,
+    UserProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -520,3 +530,208 @@ def parse_timeline_response(data, get_instructions):
                         tweets.append(tweet)
 
     return tweets, next_cursor
+
+
+# ── Trends parsers ───────────────────────────────────────────────────────
+
+
+def _parse_guide_trends(data):
+    # type: (Any) -> List[Trend]
+    """Parse trends from /i/api/2/guide.json response.
+
+    The response shape has several nesting variants — we check the common
+    ones. Each trend item carries a ``trend`` dict plus a
+    ``TimelineTrendMetadata`` chunk with the domain context / description /
+    tweet count / cluster id.
+    """
+    trends = []  # type: List[Trend]
+    instructions = _deep_get(data, "timeline", "instructions") or []
+    for instruction in instructions:
+        add_entries = instruction.get("addEntries", {})
+        entries = add_entries.get("entries", []) if isinstance(add_entries, dict) else []
+        for entry in entries:
+            content = entry.get("content", {})
+            # Old shape: content.timelineModule.items[].item.content.trend
+            items = _deep_get(content, "timelineModule", "items") or []
+            for item in items:
+                trend_dict = _deep_get(item, "item", "content", "trend")
+                if not isinstance(trend_dict, dict):
+                    continue
+                parsed = _parse_single_trend(trend_dict)
+                if parsed:
+                    trends.append(parsed)
+            # Newer shape: content.item.content.trend directly
+            direct = _deep_get(content, "item", "content", "trend")
+            if isinstance(direct, dict):
+                parsed = _parse_single_trend(direct)
+                if parsed:
+                    trends.append(parsed)
+    return trends
+
+
+def _parse_single_trend(trend_dict):
+    # type: (Dict[str, Any]) -> Optional[Trend]
+    name = trend_dict.get("name") or ""
+    if not name:
+        return None
+    metadata = trend_dict.get("trendMetadata") or {}
+    grouped = [g.get("name") for g in (trend_dict.get("groupedTrends") or []) if isinstance(g, dict)]
+    # cluster id is embedded in the url e.g. "?q=..." or inside metadata
+    url = trend_dict.get("url", {})
+    trend_url = url.get("url", "") if isinstance(url, dict) else ""
+    cluster_id = metadata.get("clusterId") or ""
+    return Trend(
+        name=name,
+        url=trend_url,
+        description=metadata.get("description") or "",
+        domain_context=metadata.get("domainContext") or "",
+        tweet_count=_parse_int(metadata.get("metaDescription"), 0)
+        if metadata.get("metaDescription") and str(metadata.get("metaDescription")).split()[0].replace(",", "").isdigit()
+        else 0,
+        grouped_trends=[g for g in grouped if g],
+        cluster_id=str(cluster_id),
+    )
+
+
+def _parse_v11_trends(data):
+    # type: (Any) -> List[Trend]
+    """Parse v1.1 trends/place.json response — a flat list of trend dicts."""
+    trends = []  # type: List[Trend]
+    if not isinstance(data, list) or not data:
+        return trends
+    for t in data[0].get("trends", []) or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or ""
+        if not name:
+            continue
+        trends.append(Trend(
+            name=name,
+            url=t.get("url") or "",
+            tweet_count=_parse_int(t.get("tweet_volume"), 0),
+        ))
+    return trends
+
+
+# ── DM parsers ───────────────────────────────────────────────────────────
+
+
+def _parse_dm_inbox(data):
+    # type: (Any) -> List[DMConversation]
+    """Parse inbox_initial_state.json into a list of DMConversation objects.
+
+    Response shape:
+      inbox_initial_state:
+        conversations: { <conv_id>: {...}, ... }
+        users: { <user_id>: {...}, ... }
+        entries: [ { message: {message_data: {...}} } ]
+    """
+    state = data.get("inbox_initial_state") if isinstance(data, dict) else None
+    if not isinstance(state, dict):
+        return []
+
+    users_map = state.get("users") or {}
+    conversations_map = state.get("conversations") or {}
+    entries = state.get("entries") or []
+
+    # Build preview text per conversation from the most recent message entry
+    previews = {}  # type: Dict[str, str]
+    for entry in entries:
+        msg = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(msg, dict):
+            continue
+        msg_data = msg.get("message_data") or {}
+        conv_id = msg.get("conversation_id") or msg_data.get("conversation_id") or ""
+        text = msg_data.get("text") or ""
+        if conv_id and conv_id not in previews and text:
+            previews[conv_id] = text
+
+    conversations = []  # type: List[DMConversation]
+    for conv_id, conv in conversations_map.items():
+        if not isinstance(conv, dict):
+            continue
+        participants = []  # type: List[DMParticipant]
+        for p in conv.get("participants", []) or []:
+            uid = str(p.get("user_id") or "")
+            u = users_map.get(uid) or {}
+            participants.append(DMParticipant(
+                user_id=uid,
+                screen_name=u.get("screen_name") or "",
+                name=u.get("name") or "",
+            ))
+        last_read = str(conv.get("last_read_event_id") or "")
+        max_entry = str(conv.get("max_entry_id") or "")
+        unread = bool(max_entry and last_read and max_entry != last_read)
+        conversations.append(DMConversation(
+            id=str(conv_id),
+            name=conv.get("name") or "",
+            type=str(conv.get("type") or "ONE_TO_ONE"),
+            participants=participants,
+            last_read_event_id=last_read,
+            max_entry_id=max_entry,
+            preview=previews.get(conv_id, ""),
+            unread=unread,
+        ))
+
+    # Sort by most-recent activity (max_entry_id is a snowflake-style id)
+    conversations.sort(key=lambda c: c.max_entry_id or "0", reverse=True)
+    return conversations
+
+
+def _parse_dm_conversation(data, conversation_id):
+    # type: (Any, str) -> Tuple[List[DMMessage], Optional[str]]
+    """Parse a single DM conversation response.
+
+    Returns (messages, next_max_id). ``next_max_id`` is the cursor for
+    the next page (older messages) — pass as ``max_id`` on the next call.
+    """
+    if not isinstance(data, dict):
+        return [], None
+
+    # Response shape: { conversation_timeline: { entries: [...], min_entry_id: "..." } }
+    timeline = data.get("conversation_timeline") or data.get("user_events") or {}
+    entries = timeline.get("entries") or []
+    if not entries and isinstance(data.get("entries"), list):
+        entries = data["entries"]
+
+    messages = []  # type: List[DMMessage]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        msg_data = msg.get("message_data") or {}
+        msg_id = str(msg.get("id") or msg_data.get("id") or "")
+        if not msg_id:
+            continue
+        media_urls = []  # type: List[str]
+        attachment = msg_data.get("attachment") or {}
+        for media_key in ("photo", "video", "animated_gif"):
+            media_obj = attachment.get(media_key)
+            if isinstance(media_obj, dict):
+                url = media_obj.get("media_url_https") or media_obj.get("media_url") or ""
+                if url:
+                    media_urls.append(url)
+
+        reply_to = None
+        reply_data = msg_data.get("reply_data") or {}
+        if isinstance(reply_data, dict) and reply_data.get("id"):
+            reply_to = str(reply_data["id"])
+
+        messages.append(DMMessage(
+            id=msg_id,
+            conversation_id=str(msg.get("conversation_id") or conversation_id),
+            sender_id=str(msg_data.get("sender_id") or msg.get("sender_id") or ""),
+            text=msg_data.get("text") or "",
+            created_at=str(msg.get("time") or msg_data.get("time") or ""),
+            media_urls=media_urls,
+            reply_to_id=reply_to,
+        ))
+
+    # min_entry_id is the oldest id in this page -> use as max_id for next page
+    next_max = timeline.get("min_entry_id")
+    status = timeline.get("status") or ""
+    if status == "AT_END":
+        next_max = None
+    return messages, str(next_max) if next_max else None

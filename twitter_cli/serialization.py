@@ -5,7 +5,18 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
-from .models import Author, BookmarkFolder, Metrics, Tweet, TweetMedia, UserProfile
+from .models import (
+    Author,
+    BookmarkFolder,
+    DMConversation,
+    DMMessage,
+    DMParticipant,
+    Metrics,
+    Trend,
+    Tweet,
+    TweetMedia,
+    UserProfile,
+)
 from .timeutil import format_iso8601, format_local_time
 
 
@@ -222,6 +233,60 @@ def users_to_json(users: Iterable[UserProfile]) -> str:
 def users_to_data(users: Iterable[UserProfile]) -> List[Dict[str, Any]]:
     """Serialize UserProfile objects to Python dicts."""
     return [user_profile_to_dict(user) for user in users]
+
+
+def trend_to_dict(trend: Trend) -> Dict[str, Any]:
+    """Convert a Trend dataclass into a JSON-safe dict."""
+    return {
+        "name": trend.name,
+        "url": trend.url,
+        "description": trend.description,
+        "domainContext": trend.domain_context,
+        "tweetCount": trend.tweet_count,
+        "groupedTrends": list(trend.grouped_trends),
+        "clusterId": trend.cluster_id,
+    }
+
+
+def trends_to_data(trends: Iterable[Trend]) -> List[Dict[str, Any]]:
+    return [trend_to_dict(t) for t in trends]
+
+
+def dm_participant_to_dict(p: DMParticipant) -> Dict[str, Any]:
+    return {"userId": p.user_id, "screenName": p.screen_name, "name": p.name}
+
+
+def dm_conversation_to_dict(conv: DMConversation) -> Dict[str, Any]:
+    return {
+        "id": conv.id,
+        "name": conv.name,
+        "type": conv.type,
+        "participants": [dm_participant_to_dict(p) for p in conv.participants],
+        "lastReadEventId": conv.last_read_event_id,
+        "maxEntryId": conv.max_entry_id,
+        "preview": conv.preview,
+        "unread": conv.unread,
+    }
+
+
+def dm_conversations_to_data(convs: Iterable[DMConversation]) -> List[Dict[str, Any]]:
+    return [dm_conversation_to_dict(c) for c in convs]
+
+
+def dm_message_to_dict(msg: DMMessage) -> Dict[str, Any]:
+    return {
+        "id": msg.id,
+        "conversationId": msg.conversation_id,
+        "senderId": msg.sender_id,
+        "text": msg.text,
+        "createdAt": msg.created_at,
+        "mediaUrls": list(msg.media_urls),
+        "replyToId": msg.reply_to_id,
+    }
+
+
+def dm_messages_to_data(msgs: Iterable[DMMessage]) -> List[Dict[str, Any]]:
+    return [dm_message_to_dict(m) for m in msgs]
 
 
 def _optional_int(value: Any) -> Optional[int]:

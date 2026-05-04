@@ -47,10 +47,21 @@ from .graphql import (
     _resolve_query_id,
     _update_features_from_html,
 )
-from .models import BookmarkFolder, UserProfile
+from .models import (
+    BookmarkFolder,
+    DMConversation,
+    DMMessage,
+    DMParticipant,
+    Trend,
+    UserProfile,
+)
 from .parser import (
     _deep_get,
+    _parse_dm_conversation,
+    _parse_dm_inbox,
+    _parse_guide_trends,
     _parse_int,
+    _parse_v11_trends,
     parse_timeline_response,
     parse_tweet_result,
     parse_user_result,
@@ -293,15 +304,25 @@ class TwitterClient:
     def fetch_user_tweets(self, user_id, count=20):
         # type: (str, int) -> List[Tweet]
         """Fetch tweets posted by a user."""
+
+        def get_user_tweets_instructions(data):
+            # type: (Any) -> Any
+            # New path (2026+): data.user.result.timeline.timeline.instructions
+            instructions = _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions")
+            if instructions is None:
+                # Legacy path: data.user.result.timeline_v2.timeline.instructions
+                instructions = _deep_get(data, "data", "user", "result", "timeline_v2", "timeline", "instructions")
+            return instructions
+
         return self._fetch_timeline(
             "UserTweets",
             count,
-            lambda data: _deep_get(data, "data", "user", "result", "timeline_v2", "timeline", "instructions"),
+            get_user_tweets_instructions,
             extra_variables={
                 "userId": user_id,
+                "includePromotedContent": True,
                 "withQuickPromoteEligibilityTweetFields": True,
                 "withVoice": True,
-                "withV2Timeline": True,
             },
         )
 
@@ -385,6 +406,25 @@ class TwitterClient:
             },
         )
 
+    def resolve_article_id(self, article_id):
+        # type: (str) -> str
+        """Resolve an article ID (from /i/article/<id> URLs) to its parent tweet ID.
+
+        Article IDs differ from tweet IDs. This method searches for the tweet
+        that contains the article and returns its tweet ID.
+        """
+        logger.debug("resolve_article_id: article_id=%s", article_id)
+        query = "url:x.com/i/article/%s" % article_id
+        results = self.fetch_search(query, count=1, product="Top")
+        if not results:
+            raise NotFoundError(
+                "Could not find tweet for article %s. "
+                "Try passing the tweet URL (x.com/<user>/status/<id>) instead." % article_id
+            )
+        tweet_id = results[0].id
+        logger.info("resolve_article_id: %s -> tweet %s", article_id, tweet_id)
+        return tweet_id
+
     def fetch_article(self, tweet_id):
         # type: (str) -> Tweet
         """Fetch a Twitter Article by tweet ID."""
@@ -450,6 +490,144 @@ class TwitterClient:
             "Following", user_id, count,
             lambda data: _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions"),
         )
+
+    # ── Trends ───────────────────────────────────────────────────────
+
+    def fetch_trends(self, woeid=1, count=50):
+        # type: (int, int) -> List[Trend]
+        """Fetch trending topics from the x.com Explore/guide endpoint.
+
+        Uses the v2 "guide" endpoint (what the web client calls for the
+        "What's happening" sidebar). Falls back to v1.1 trends/place.json
+        if guide.json rejects the request.
+
+        Args:
+            woeid: Yahoo WOEID for a location (1 = worldwide, 23424977 = US).
+            count: Max number of trends to return.
+        """
+        # Prefer the v2 guide endpoint: it powers the Explore trends UI and
+        # returns grouped/clustered trends with descriptions + cluster IDs
+        # (the numeric id in /i/trending/<id> URLs).
+        url = (
+            "https://x.com/i/api/2/guide.json"
+            "?include_profile_interstitial_type=1"
+            "&include_blocking=1&include_blocked_by=1&include_followed_by=1"
+            "&include_want_retweets=1&include_mute_edge=1&include_can_dm=1"
+            "&include_can_media_tag=1&include_ext_is_blue_verified=1"
+            "&skip_status=1&cards_platform=Web-12"
+            "&include_cards=1&include_ext_alt_text=true"
+            "&include_quote_count=true&include_reply_count=1"
+            "&tweet_mode=extended&include_entities=true"
+            "&include_user_entities=true&include_ext_media_color=true"
+            "&include_ext_media_availability=true"
+            "&send_error_codes=true&simple_quoted_tweet=true"
+            "&count=%d&candidate_source=trends&entity_tokens=false"
+            "&ext=mediaStats,highlightedLabel"
+        ) % max(count, 20)
+        try:
+            data = self._api_get(url)
+            trends = _parse_guide_trends(data)
+            if trends:
+                return trends[:count]
+        except TwitterAPIError as exc:
+            logger.debug("guide.json trends failed (%s), falling back to v1.1", exc)
+
+        # Fallback: v1.1 trends/place.json — plain list, fewer metadata fields
+        url = "https://x.com/i/api/1.1/trends/place.json?id=%d" % woeid
+        data = self._api_get(url)
+        return _parse_v11_trends(data)[:count]
+
+    def fetch_trend_timeline(self, cluster_id, count=40):
+        # type: (str, int) -> List[Tweet]
+        """Fetch tweets for a trending cluster ID.
+
+        ``cluster_id`` is the numeric id from a /i/trending/<id> URL. Uses
+        the ``GenericTimelineById`` GraphQL operation, which powers the
+        "what people are posting" view on the Trend detail page.
+        """
+        return self._fetch_timeline(
+            "GenericTimelineById",
+            count,
+            lambda data: _deep_get(data, "data", "timeline_response", "timeline", "instructions")
+            or _deep_get(data, "data", "timeline", "timeline", "instructions"),
+            extra_variables={
+                "timelineId": str(cluster_id),
+            },
+            override_base_variables=True,
+        )
+
+    # ── Direct Messages (read-only) ──────────────────────────────────
+
+    def fetch_dm_inbox(self, count=50):
+        # type: (int) -> List[DMConversation]
+        """Fetch the DM inbox — list of recent conversations.
+
+        Uses ``/i/api/1.1/dm/inbox_initial_state.json`` which is the
+        endpoint the x.com web client calls on DM panel open.
+        """
+        url = (
+            "https://x.com/i/api/1.1/dm/inbox_initial_state.json"
+            "?nsfw_filtering_enabled=false&filter_low_quality=false"
+            "&include_quality=all&include_profile_interstitial_type=1"
+            "&include_blocking=1&include_blocked_by=1&include_followed_by=1"
+            "&include_want_retweets=1&include_mute_edge=1&include_can_dm=1"
+            "&include_can_media_tag=1&include_ext_is_blue_verified=1"
+            "&skip_status=1&dm_secret_conversations_enabled=false"
+            "&krs_registration_enabled=true&cards_platform=Web-12"
+            "&include_cards=1&include_ext_alt_text=true"
+            "&include_quote_count=true&include_reply_count=1"
+            "&tweet_mode=extended&include_groups=true&include_inbox_timelines=true"
+            "&include_ext_media_color=true&supports_reactions=true"
+            "&include_conversation_info=true&ext=mediaColor,altText,mediaStats"
+        )
+        data = self._api_get(url)
+        return _parse_dm_inbox(data)[:count]
+
+    def fetch_dm_conversation(self, conversation_id, count=50):
+        # type: (str, int) -> List[DMMessage]
+        """Fetch messages in a DM conversation (most recent first).
+
+        ``conversation_id`` is the Twitter internal ID, typically
+        ``<user_a_id>-<user_b_id>`` (sorted ascending). For group DMs it
+        is a single numeric string.
+        """
+        messages = []  # type: List[DMMessage]
+        max_id = None  # type: Optional[str]
+        attempts = 0
+        max_attempts = int(math.ceil(count / 50.0)) + 1
+
+        while len(messages) < count and attempts < max_attempts:
+            attempts += 1
+            url = (
+                "https://x.com/i/api/1.1/dm/conversation/%s.json"
+                "?context=FETCH_DM_CONVERSATION_HISTORY&include_profile_interstitial_type=1"
+                "&include_blocking=1&include_blocked_by=1&include_followed_by=1"
+                "&include_want_retweets=1&include_mute_edge=1&include_can_dm=1"
+                "&include_can_media_tag=1&include_ext_is_blue_verified=1"
+                "&skip_status=1&cards_platform=Web-12&include_cards=1"
+                "&include_ext_alt_text=true&include_quote_count=true"
+                "&include_reply_count=1&tweet_mode=extended"
+                "&include_ext_media_color=true&include_ext_media_availability=true"
+                "&supports_reactions=true&count=50"
+                "&ext=mediaColor,altText,mediaStats"
+            ) % urllib.parse.quote(conversation_id, safe="")
+            if max_id:
+                url += "&max_id=%s" % urllib.parse.quote(max_id, safe="")
+
+            data = self._api_get(url)
+            page_messages, next_max = _parse_dm_conversation(data, conversation_id)
+
+            if not page_messages:
+                break
+            messages.extend(page_messages)
+            if not next_max or next_max == max_id:
+                break
+            max_id = next_max
+
+            if len(messages) < count and self._request_delay > 0:
+                time.sleep(self._request_delay * random.uniform(0.7, 1.5))
+
+        return messages[:count]
 
     # ── Write operations ─────────────────────────────────────────────
 

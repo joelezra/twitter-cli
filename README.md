@@ -119,7 +119,24 @@ twitter following elonmusk --max 50
 
 twitter whoami                                # Current authenticated user
 twitter status                                # Auth check
+
+twitter trends                                # Trending topics (x.com Explore)
+twitter trends --woeid 23424977 -n 20         # US trends (1 = worldwide)
+twitter trend 2047489014127538677             # Tweets for a /i/trending/<id> cluster
+twitter trend https://x.com/i/trending/...    # Accepts full URL
+
+twitter dms                                   # List DM conversations
+twitter dm <conversation_id> -n 50            # Read messages in a conversation
 ```
+
+> **Trends note:** `twitter trends` reads the Explore/"What's happening" feed. The
+> cluster ID in `/i/trending/<id>` URLs is served by an unstable internal op —
+> if `twitter trend <id>` returns an internal error, fall back to
+> `twitter search "<trend name>" --type Top`.
+
+> **DMs note:** Read-only today (list inbox, read threads). Messages are
+> returned newest-first in JSON/YAML output and rendered oldest-first
+> (transcript order) in the rich table.
 
 ### Write
 

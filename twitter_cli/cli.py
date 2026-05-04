@@ -73,6 +73,9 @@ from .output import (
     use_rich_output,
 )
 from .serialization import (
+    dm_conversations_to_data,
+    dm_messages_to_data,
+    trends_to_data,
     tweet_to_dict,
     tweets_from_json,
     tweets_to_data,
@@ -218,6 +221,21 @@ def _normalize_tweet_id(value):
     if not candidate.isdigit():
         raise RuntimeError("Invalid tweet ID: %s" % value)
     return candidate
+
+
+def _is_standalone_article_url(value):
+    # type: (str) -> bool
+    """Check if a URL is a standalone article URL (/i/article/<id>).
+
+    These URLs use article-specific IDs that differ from tweet IDs
+    and require resolution via search before fetching.
+    """
+    raw = value.strip()
+    parsed = urllib.parse.urlparse(raw)
+    if not (parsed.scheme and parsed.netloc):
+        return False
+    path = parsed.path.rstrip("/")
+    return bool(re.search(r"/i/article/\d+$", path))
 
 
 def _apply_filter(tweets, do_filter, config, rich_output=True):
@@ -935,12 +953,19 @@ def article(ctx, tweet_id, as_json, as_yaml, as_markdown, output_file):
     if as_markdown and (as_json or as_yaml):
         raise click.UsageError("Use only one of --markdown, --json, or --yaml.")
 
+    is_article_url = _is_standalone_article_url(tweet_id)
     tweet_id = _normalize_tweet_id(tweet_id)
     config = load_config()
     mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
     rich_output = (mode is None) and not as_markdown
     try:
         client = _get_client(config, quiet=not rich_output)
+        if is_article_url:
+            if rich_output:
+                console.print("📰 Resolving article %s...\n" % tweet_id)
+            tweet_id = client.resolve_article_id(tweet_id)
+            if rich_output:
+                console.print("🔗 Found parent tweet %s\n" % tweet_id)
         if rich_output:
             console.print("📰 Fetching article %s...\n" % tweet_id)
         start = time.time()
@@ -1375,6 +1400,222 @@ def unbookmark(tweet_id, as_json, as_yaml):
     _write_action("🔖", "Removing bookmark", "unbookmark_tweet", tweet_id, as_json=as_json, as_yaml=as_yaml)
 
 
+
+
+# ── Trends ──────────────────────────────────────────────────────────────
+
+
+@cli.command(name="trends")
+@click.option("--woeid", type=int, default=1, help="WOEID location id (1 = worldwide, 23424977 = US).")
+@click.option("--max", "-n", "max_count", type=int, default=50, help="Max number of trends to fetch.")
+@structured_output_options
+@click.pass_context
+def trends_cmd(ctx, woeid, max_count, as_json, as_yaml):
+    # type: (Any, int, int, bool, bool) -> None
+    """List current trending topics (the x.com Explore / "What's happening" feed)."""
+    config = load_config()
+    rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+
+    def _run():
+        client = _get_client(config, quiet=not rich_output)
+        if rich_output:
+            console.print("📈 Fetching trends (woeid=%d)..." % woeid)
+        items = client.fetch_trends(woeid=woeid, count=max_count)
+        if rich_output:
+            console.print("✅ Got %d trends\n" % len(items))
+
+        data = trends_to_data(items)
+        if emit_structured(data, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        from rich.table import Table
+        table = Table(title="📈 Trends — %d" % len(items))
+        table.add_column("#", style="dim")
+        table.add_column("Name", style="bold")
+        table.add_column("Context", style="cyan")
+        table.add_column("Volume", justify="right")
+        table.add_column("Cluster ID", style="dim")
+        for i, t in enumerate(items, 1):
+            vol = "%d" % t.tweet_count if t.tweet_count else ""
+            table.add_row(str(i), t.name, t.domain_context or t.description, vol, t.cluster_id)
+        console.print(table)
+        console.print()
+        console.print("[dim]💡 Use `twitter trend <cluster_id>` or `twitter search \"<name>\"` to drill in.[/dim]")
+
+    _run_guarded(_run)
+
+
+@cli.command(name="trend")
+@click.argument("target")
+@click.option("--max", "-n", "max_count", type=int, default=None, help="Max tweets to fetch.")
+@structured_output_options
+@click.option("--full-text", is_flag=True, help="Show full tweet text in table output.")
+@click.pass_context
+def trend_cmd(ctx, target, max_count, as_json, as_yaml, full_text):
+    # type: (Any, str, Optional[int], bool, bool, bool) -> None
+    """Fetch tweets for a trend. TARGET is either a /i/trending/<id> cluster ID or a full URL.
+
+    \b
+    Examples:
+        twitter trend 2047489014127538677
+        twitter trend https://x.com/i/trending/2047489014127538677
+    """
+    # Accept either a raw numeric ID or a full /i/trending/<id> URL
+    raw = target.strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        m = re.search(r"/i/trending/(\d+)", parsed.path)
+        if not m:
+            raise click.UsageError("Invalid trend URL: %s" % target)
+        cluster_id = m.group(1)
+    else:
+        cluster_id = raw.split("?", 1)[0].split("#", 1)[0]
+        if not cluster_id.isdigit():
+            raise click.UsageError("Invalid trend id (expected numeric cluster id): %s" % target)
+
+    compact = ctx.obj.get("compact", False)
+    config = load_config()
+
+    def _run():
+        client = _get_client(config)
+        try:
+            tweets = client.fetch_trend_timeline(cluster_id, _resolve_configured_count(config, max_count))
+        except (TwitterError, RuntimeError) as exc:
+            mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+            if _emit_mode_payload(
+                error_payload(
+                    _error_code_from_exc(exc), str(exc),
+                    details={"hint": "cluster IDs from /i/trending/<id> are not always queryable — try `twitter search \"<trend name>\"` instead."},
+                ),
+                mode,
+            ):
+                sys.exit(1)
+            console.print(
+                "[yellow]⚠️  Could not fetch timeline for cluster %s: %s[/yellow]" % (cluster_id, exc)
+            )
+            console.print(
+                "[dim]💡 Run `twitter trends` to find the trend's name, "
+                "then `twitter search \"<name>\" --type Top` to see tweets.[/dim]"
+            )
+            sys.exit(1)
+
+        filtered = tweets
+        save_tweet_cache(filtered)
+        if compact:
+            click.echo(tweets_to_compact_json(filtered))
+            return
+        if emit_structured(tweets_to_data(filtered), as_json=as_json, as_yaml=as_yaml):
+            return
+        print_tweet_table(filtered, console, title="📈 Trend %s — %d tweets" % (cluster_id, len(filtered)), full_text=full_text)
+        _print_show_hint()
+        console.print()
+
+    _run_guarded(_run)
+
+
+# ── Direct Messages (read) ──────────────────────────────────────────────
+
+
+@cli.command(name="dms")
+@click.option("--max", "-n", "max_count", type=int, default=30, help="Max conversations to list.")
+@structured_output_options
+@click.pass_context
+def dms_cmd(ctx, max_count, as_json, as_yaml):
+    # type: (Any, int, bool, bool) -> None
+    """List recent DM conversations."""
+    config = load_config()
+    rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+
+    def _run():
+        client = _get_client(config, quiet=not rich_output)
+        if rich_output:
+            console.print("📬 Fetching DM inbox...")
+        convs = client.fetch_dm_inbox(count=max_count)
+        if rich_output:
+            console.print("✅ Got %d conversations\n" % len(convs))
+
+        data = dm_conversations_to_data(convs)
+        if emit_structured(data, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        from rich.table import Table
+        table = Table(title="📬 DMs — %d conversations" % len(convs))
+        table.add_column("#", style="dim")
+        table.add_column("ID", style="dim")
+        table.add_column("Participants", style="bold")
+        table.add_column("Last message", overflow="fold")
+        table.add_column("New", style="yellow")
+        for i, c in enumerate(convs, 1):
+            if c.type == "GROUP_DM":
+                label = c.name or "(group: %d people)" % len(c.participants)
+            else:
+                others = [p for p in c.participants if p.screen_name]
+                label = ", ".join("@%s" % p.screen_name for p in others[:3]) or "(1:1)"
+            preview = (c.preview or "").replace("\n", " ")
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            table.add_row(str(i), c.id, label, preview, "•" if c.unread else "")
+        console.print(table)
+        console.print()
+        console.print("[dim]💡 Use `twitter dm <id>` to read a conversation.[/dim]")
+
+    _run_guarded(_run)
+
+
+@cli.command(name="dm")
+@click.argument("conversation_id")
+@click.option("--max", "-n", "max_count", type=int, default=50, help="Max messages to fetch.")
+@structured_output_options
+@click.pass_context
+def dm_cmd(ctx, conversation_id, max_count, as_json, as_yaml):
+    # type: (Any, str, int, bool, bool) -> None
+    """Read messages in a DM conversation. CONVERSATION_ID is the id from `twitter dms`."""
+    config = load_config()
+    rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+
+    def _run():
+        client = _get_client(config, quiet=not rich_output)
+        if rich_output:
+            console.print("💬 Fetching conversation %s..." % conversation_id)
+        messages = client.fetch_dm_conversation(conversation_id, count=max_count)
+        if rich_output:
+            console.print("✅ Got %d messages\n" % len(messages))
+
+        # Try to resolve the "me" id so we can label messages outbound vs. inbound
+        me_id = ""
+        try:
+            me_id = client.fetch_me().id
+        except Exception:
+            pass
+
+        data = dm_messages_to_data(messages)
+        if emit_structured(data, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        from rich.table import Table
+        table = Table(title="💬 Conversation %s — %d messages" % (conversation_id, len(messages)))
+        table.add_column("Time", style="dim")
+        table.add_column("From", style="cyan")
+        table.add_column("Text", overflow="fold")
+        # Render oldest-first so the CLI reads top-to-bottom like a transcript
+        for m in reversed(messages):
+            who = "me" if (me_id and m.sender_id == me_id) else m.sender_id
+            ts = m.created_at
+            if ts and ts.isdigit():
+                try:
+                    import datetime as _dt
+                    ts = _dt.datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pass
+            text = m.text
+            if m.media_urls:
+                text = (text + " ") if text else ""
+                text += "[%d media]" % len(m.media_urls)
+            table.add_row(ts, who, text)
+        console.print(table)
+        console.print()
+
+    _run_guarded(_run)
 
 
 if __name__ == "__main__":

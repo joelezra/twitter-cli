@@ -271,6 +271,73 @@ def test_cli_article_rejects_compact_mode() -> None:
     assert "does not support --compact" in result.output
 
 
+def test_cli_article_resolves_standalone_article_url(monkeypatch) -> None:
+    """Standalone /i/article/<id> URLs use article-specific IDs that differ from tweet IDs.
+
+    The CLI should resolve the article ID to a tweet ID via search, then fetch.
+    """
+    resolved_tweet_id = "99999"
+
+    class FakeClient:
+        def resolve_article_id(self, article_id: str) -> str:
+            assert article_id == "77777"
+            return resolved_tweet_id
+
+        def fetch_article(self, tweet_id: str) -> Tweet:
+            assert tweet_id == resolved_tweet_id
+            return Tweet(
+                id=resolved_tweet_id,
+                text="https://t.co/article",
+                author=Author(id="u1", name="Will", screen_name="athcanft"),
+                metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
+                created_at="2026-03-31",
+                article_title="Resolved Article",
+                article_text="Body text",
+            )
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["article", "https://x.com/i/article/77777", "--json"])
+
+    assert result.exit_code == 0
+    payload = yaml.safe_load(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["id"] == resolved_tweet_id
+    assert payload["data"]["articleTitle"] == "Resolved Article"
+
+
+def test_cli_article_does_not_resolve_user_article_url(monkeypatch) -> None:
+    """URLs like /user/article/<id> use tweet IDs and should NOT trigger resolution."""
+
+    class FakeClient:
+        def fetch_article(self, tweet_id: str) -> Tweet:
+            assert tweet_id == "12345"
+            return Tweet(
+                id="12345",
+                text="https://t.co/article",
+                author=Author(id="u1", name="Alice", screen_name="alice"),
+                metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
+                created_at="2026-03-11",
+                article_title="Direct Article",
+                article_text="Body",
+            )
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["article", "https://x.com/user/article/12345", "--json"])
+
+    assert result.exit_code == 0
+    payload = yaml.safe_load(result.output)
+    assert payload["data"]["articleTitle"] == "Direct Article"
+
+
 def test_cli_bookmark_alias_works(monkeypatch) -> None:
     calls = []
 

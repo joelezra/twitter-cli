@@ -62,6 +62,47 @@ class BookmarkFolder:
 
 
 @dataclass
+class Trend:
+    name: str
+    url: str = ""
+    description: str = ""
+    domain_context: str = ""  # e.g. "Trending in Technology", category
+    tweet_count: int = 0
+    grouped_trends: List[str] = field(default_factory=list)
+    cluster_id: str = ""  # numeric id used in /i/trending/<id> URLs
+
+
+@dataclass
+class DMParticipant:
+    user_id: str
+    screen_name: str = ""
+    name: str = ""
+
+
+@dataclass
+class DMMessage:
+    id: str
+    conversation_id: str
+    sender_id: str
+    text: str
+    created_at: str  # ms epoch as string
+    media_urls: List[str] = field(default_factory=list)
+    reply_to_id: Optional[str] = None
+
+
+@dataclass
+class DMConversation:
+    id: str
+    name: str = ""  # group name (empty for 1:1)
+    type: str = "ONE_TO_ONE"  # or "GROUP_DM"
+    participants: List[DMParticipant] = field(default_factory=list)
+    last_read_event_id: str = ""
+    max_entry_id: str = ""  # most recent message id
+    preview: str = ""  # most recent message text snippet
+    unread: bool = False
+
+
+@dataclass
 class UserProfile:
     id: str
     name: str
