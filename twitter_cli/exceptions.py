@@ -48,6 +48,15 @@ class QueryIdError(TwitterError):
     error_code = "query_id_error"
 
 
+class OndemandBundleNotFound(TwitterError):
+    """Raised when the x.com web shell exposes no ondemand.s bundle reference.
+
+    Without that bundle the x-client-transaction-id header cannot be derived.
+    """
+
+    error_code = "ondemand_bundle_not_found"
+
+
 class MediaUploadError(TwitterError):
     """Raised when media upload fails (file not found, too large, unsupported format, API error)."""
 

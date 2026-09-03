@@ -37,6 +37,7 @@ from .constants import (
 from .exceptions import (
     MediaUploadError,
     NotFoundError,
+    OndemandBundleNotFound,
     TwitterAPIError,
 )
 from .graphql import (
@@ -49,11 +50,14 @@ from .graphql import (
 )
 from .models import (
     BookmarkFolder,
+    UserProfile,
+)
+
+# Referenced only from `# type:` comments, which ruff does not parse but mypy does.
+from .models import (  # noqa: F401
     DMConversation,
     DMMessage,
-    DMParticipant,
     Trend,
-    UserProfile,
 )
 from .parser import (
     _deep_get,
@@ -132,6 +136,27 @@ def _get_cffi_session():
     return _cffi_session
 
 
+def _resolve_ondemand_file_url(home_page_response):
+    # type: (Any) -> str
+    """Resolve the ``ondemand.s`` bundle URL from an x.com web-shell response.
+
+    ``get_ondemand_file_url`` regex-scrapes the webpack manifest and raises a
+    bare ``AttributeError`` ("'NoneType' object has no attribute 'group'") when
+    the manifest entry is absent, which says nothing useful in a log line.  X
+    only embeds that entry in the authenticated ``responsive-web/client-web``
+    shell — the logged-out homepage is now a separate lightweight app with no
+    webpack manifest at all — so a miss means we were served the wrong shell.
+    """
+    try:
+        return get_ondemand_file_url(response=home_page_response)
+    except AttributeError:
+        raise OndemandBundleNotFound(
+            "x.com response contains no ondemand.s bundle reference; the "
+            "homepage fetch must be authenticated to receive the "
+            "responsive-web web shell that embeds it"
+        )
+
+
 def _url_fetch(url, headers=None):
     # type: (str, Optional[Dict[str, str]]) -> str
     """URL fetch using curl_cffi for proper TLS fingerprint."""
@@ -164,22 +189,28 @@ class TwitterClient:
 
     # ── Read operations ──────────────────────────────────────────────
 
-    def fetch_home_timeline(self, count=20):
-        # type: (int) -> List[Tweet]
+    def fetch_home_timeline(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
+        # type: (int, bool, Optional[str], bool) -> Any
         """Fetch home timeline tweets."""
         return self._fetch_timeline(
             "HomeTimeline",
             count,
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
+            include_promoted=include_promoted,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
-    def fetch_following_feed(self, count=20):
-        # type: (int) -> List[Tweet]
+    def fetch_following_feed(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
+        # type: (int, bool, Optional[str], bool) -> Any
         """Fetch chronological following feed."""
         return self._fetch_timeline(
             "HomeLatestTimeline",
             count,
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
+            include_promoted=include_promoted,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
     def fetch_bookmarks(self, count=50):
@@ -285,20 +316,23 @@ class TwitterClient:
             raise NotFoundError("User @%s not found" % screen_name)
 
         legacy = result.get("legacy", {})
+        core = result.get("core", {})
+        avatar = result.get("avatar", {})
+        location_obj = result.get("location", {})
         return UserProfile(
             id=result.get("rest_id", ""),
-            name=legacy.get("name", ""),
-            screen_name=legacy.get("screen_name", screen_name),
+            name=core.get("name") or legacy.get("name", ""),
+            screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
             bio=legacy.get("description", ""),
-            location=legacy.get("location", ""),
+            location=location_obj.get("location") or legacy.get("location", ""),
             url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
             followers_count=_parse_int(legacy.get("followers_count"), 0),
             following_count=_parse_int(legacy.get("friends_count"), 0),
             tweets_count=_parse_int(legacy.get("statuses_count"), 0),
             likes_count=_parse_int(legacy.get("favourites_count"), 0),
             verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
-            profile_image_url=legacy.get("profile_image_url_https", ""),
-            created_at=legacy.get("created_at", ""),
+            profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
+            created_at=core.get("created_at") or legacy.get("created_at", ""),
         )
 
     def fetch_user_tweets(self, user_id, count=20):
@@ -464,8 +498,8 @@ class TwitterClient:
         logger.info("fetch_article: tweet_id=%s", tweet_id)
         return tweet
 
-    def fetch_list_timeline(self, list_id, count=20):
-        # type: (str, int) -> List[Tweet]
+    def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
+        # type: (str, int, Optional[str], bool) -> Any
         """Fetch tweets from a Twitter List."""
         return self._fetch_timeline(
             "ListLatestTweetsTimeline",
@@ -473,6 +507,8 @@ class TwitterClient:
             lambda data: _deep_get(data, "data", "list", "tweets_timeline", "timeline", "instructions"),
             extra_variables={"listId": list_id},
             override_base_variables=True,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
     def fetch_followers(self, user_id, count=20):
@@ -481,6 +517,7 @@ class TwitterClient:
         return self._fetch_user_list(
             "Followers", user_id, count,
             lambda data: _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions"),
+            use_post=True,
         )
 
     def fetch_following(self, user_id, count=20):
@@ -489,6 +526,7 @@ class TwitterClient:
         return self._fetch_user_list(
             "Following", user_id, count,
             lambda data: _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions"),
+            use_post=True,
         )
 
     # ── Trends ───────────────────────────────────────────────────────
@@ -910,8 +948,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool) -> List[Tweet]
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -929,7 +967,8 @@ class TwitterClient:
 
         tweets = []  # type: List[Tweet]
         seen_ids = set()  # type: Set[str]
-        cursor = None  # type: Optional[str]
+        cursor = start_cursor  # type: Optional[str]
+        continuation_cursor = None  # type: Optional[str]
         attempts = 0
         max_attempts = int(math.ceil(count / 20.0)) + 2
 
@@ -941,7 +980,7 @@ class TwitterClient:
             else:
                 variables = {
                     "count": min(count - len(tweets) + 5, 40),
-                    "includePromotedContent": False,
+                    "includePromotedContent": include_promoted,
                     "latestControlAvailable": True,
                     "requestContext": "launch",
                 }
@@ -962,10 +1001,13 @@ class TwitterClient:
                     tweets.append(tweet)
 
             if not next_cursor:
+                continuation_cursor = None
                 break
             if next_cursor == cursor:
                 logger.debug("Timeline pagination stopped because cursor did not advance: %s", next_cursor)
+                continuation_cursor = None
                 break
+            continuation_cursor = next_cursor
             cursor = next_cursor
 
             if not new_tweets:
@@ -977,10 +1019,12 @@ class TwitterClient:
                 logger.debug("Sleeping %.1fs between requests", jitter)
                 time.sleep(jitter)
 
+        if return_cursor:
+            return tweets[:count], continuation_cursor
         return tweets[:count]
 
-    def _fetch_user_list(self, operation_name, user_id, count, get_instructions):
-        # type: (str, str, int, Callable[[Any], Any]) -> List[UserProfile]
+    def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
+        # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
         """Generic user list fetcher (for followers/following) with pagination."""
         if count <= 0:
             return []
@@ -1001,7 +1045,10 @@ class TwitterClient:
             if cursor:
                 variables["cursor"] = cursor
 
-            data = self._graphql_get(operation_name, variables, FEATURES)
+            if use_post:
+                data = self._graphql_post(operation_name, variables, FEATURES)
+            else:
+                data = self._graphql_get(operation_name, variables, FEATURES)
             instructions = get_instructions(data)
             if not instructions:
                 logger.warning("No user list instructions found")
@@ -1181,6 +1228,13 @@ class TwitterClient:
 
     # ── Internal: Anti-detection / headers ───────────────────────────
 
+    def _cookie_header(self):
+        # type: () -> str
+        """Return the Cookie header value for authenticated x.com requests."""
+        if self._cookie_string:
+            return self._cookie_string
+        return "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0)
+
     @staticmethod
     def _ct_cache_path():
         # type: () -> str
@@ -1222,13 +1276,16 @@ class TwitterClient:
         try:
             cache_path = self._ct_cache_path()
             cache_dir = os.path.dirname(cache_path)
-            os.makedirs(cache_dir, exist_ok=True)
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
             cache = {
                 "home_html": home_html,
                 "ondemand_text": ondemand_text,
                 "created_at": time.time(),
             }
-            with open(cache_path, "w", encoding="utf-8") as f:
+            # home_html is the *authenticated* web shell and embeds the signed-in
+            # account's own profile data, so keep the cache owner-readable only.
+            fd = os.open(cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(cache, f)
             logger.debug("Saved CT cache to %s", cache_path)
         except Exception as exc:
@@ -1255,13 +1312,18 @@ class TwitterClient:
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            # The homepage fetch must carry the session cookies.  Anonymous
+            # requests to x.com now get a lightweight logged-out app that has
+            # no webpack manifest, so the ondemand.s bundle — the source of
+            # the KEY_BYTE indices — cannot be located from it.
             home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
+                "https://x.com",
+                headers=dict(ct_headers, Cookie=self._cookie_header()),
+                timeout=10,
             )
             home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
-            ondemand_url = get_ondemand_file_url(response=home_page_response)
-            if not ondemand_url:
-                raise ValueError("Failed to extract ondemand file URL from homepage")
+            ondemand_url = _resolve_ondemand_file_url(home_page_response)
+            # abs.twimg.com is a plain CDN; do not hand it session cookies.
             ondemand_file = cffi_session.get(
                 ondemand_url, headers=ct_headers, timeout=10,
             )
@@ -1284,7 +1346,7 @@ class TwitterClient:
         """Build shared headers for authenticated API calls."""
         headers = {
             "Authorization": "Bearer %s" % BEARER_TOKEN,
-            "Cookie": self._cookie_string or "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0),
+            "Cookie": self._cookie_header(),
             "X-Csrf-Token": self._ct0,
             "X-Twitter-Active-User": "yes",
             "X-Twitter-Auth-Type": "OAuth2Session",

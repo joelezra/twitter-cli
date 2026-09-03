@@ -6,6 +6,7 @@ and feature flag update logic — all without requiring network access.
 
 from __future__ import annotations
 
+import bs4
 import copy
 from unittest.mock import MagicMock, patch
 
@@ -14,9 +15,10 @@ import pytest
 
 from twitter_cli.client import (
     _best_chrome_target,
+    _resolve_ondemand_file_url,
     TwitterClient,
 )
-from twitter_cli.exceptions import TwitterAPIError
+from twitter_cli.exceptions import OndemandBundleNotFound, TwitterAPIError
 from twitter_cli.graphql import (
     FEATURES,
     FALLBACK_QUERY_IDS,
@@ -208,7 +210,7 @@ class TestBuildGraphqlUrl:
 
     def test_searchtimeline_fallback_query_id_regression(self):
         """Keep SearchTimeline fallback aligned with the live operation after issue #39."""
-        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "rkp6b4vtR9u7v3naGoOzUQ"
+        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "VhUd6vHVmLBcw0uX-6jMLA"
 
 
 # ── _best_chrome_target ──────────────────────────────────────────────────
@@ -333,6 +335,24 @@ class TestBuildHeaders:
 
 
 class TestPaginationBehavior:
+    def test_fetch_timeline_can_include_promoted_content(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+
+        calls = []
+
+        def _graphql_get(operation_name, variables, features, field_toggles=None):
+            calls.append(variables.copy())
+            return {"page": 1}
+
+        client._graphql_get = _graphql_get
+
+        with patch('twitter_cli.client.parse_timeline_response', return_value=([], None)):
+            client._fetch_timeline("HomeTimeline", 1, lambda data: data, include_promoted=True)
+
+        assert calls[0]["includePromotedContent"] is True
+
     def test_continues_when_cursor_advances_without_new_tweets(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
@@ -378,6 +398,61 @@ class TestPaginationBehavior:
 
         assert tweets == []
         assert calls == [None, "cursor-same"]
+
+    def test_fetch_timeline_returns_continuation_cursor(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+
+        calls = []
+
+        def _graphql_get(operation_name, variables, features, field_toggles=None):
+            calls.append(variables.copy())
+            return {"page": 1}
+
+        client._graphql_get = _graphql_get
+
+        tweet = MagicMock(id="tweet-1")
+        with patch('twitter_cli.client.parse_timeline_response', return_value=([tweet], "cursor-next")):
+            tweets, cursor = client._fetch_timeline(
+                "HomeTimeline",
+                1,
+                lambda data: data,
+                start_cursor="cursor-prev",
+                return_cursor=True,
+            )
+
+        assert [item.id for item in tweets] == ["tweet-1"]
+        assert cursor == "cursor-next"
+        assert calls[0]["cursor"] == "cursor-prev"
+
+    def test_fetch_list_timeline_accepts_cursor_and_returns_cursor(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+
+        calls = []
+
+        def _graphql_get(operation_name, variables, features, field_toggles=None):
+            calls.append((operation_name, variables.copy()))
+            return {"page": 1}
+
+        client._graphql_get = _graphql_get
+
+        tweet = MagicMock(id="tweet-1")
+        with patch('twitter_cli.client.parse_timeline_response', return_value=([tweet], "cursor-next")):
+            tweets, cursor = client.fetch_list_timeline(
+                "list-1",
+                1,
+                cursor="cursor-prev",
+                return_cursor=True,
+            )
+
+        assert [item.id for item in tweets] == ["tweet-1"]
+        assert cursor == "cursor-next"
+        assert calls[0][0] == "ListLatestTweetsTimeline"
+        assert calls[0][1]["listId"] == "list-1"
+        assert calls[0][1]["cursor"] == "cursor-prev"
 
     def test_user_list_continues_when_cursor_advances_without_new_users(self):
         client = TwitterClient.__new__(TwitterClient)
@@ -1185,6 +1260,89 @@ class TestParseUserResult:
         assert user.tweets_count == 78
         assert user.likes_count == 0
 
+    def test_reads_core_avatar_location_when_legacy_absent(self):
+        """New API shape: name/screen_name/created_at moved to core{},
+        profile_image_url to avatar.image_url, location to location.location.
+        legacy{} may be empty or missing entirely."""
+        user = parse_user_result(
+            {
+                "rest_id": "user-2",
+                "core": {
+                    "name": "Bob",
+                    "screen_name": "bob",
+                    "created_at": "Tue Mar 21 17:25:43 +0000 2023",
+                },
+                "avatar": {"image_url": "https://example.com/bob.jpg"},
+                "location": {"location": "Earth"},
+                "is_blue_verified": True,
+            }
+        )
+
+        assert user is not None
+        assert user.id == "user-2"
+        assert user.name == "Bob"
+        assert user.screen_name == "bob"
+        assert user.created_at == "Tue Mar 21 17:25:43 +0000 2023"
+        assert user.profile_image_url == "https://example.com/bob.jpg"
+        assert user.location == "Earth"
+        assert user.verified is True
+
+    def test_prefers_core_over_legacy_when_both_present(self):
+        """During the migration both shapes coexist — core{} should win."""
+        user = parse_user_result(
+            {
+                "rest_id": "user-3",
+                "core": {"name": "NewName", "screen_name": "new_handle"},
+                "avatar": {"image_url": "https://example.com/new.jpg"},
+                "legacy": {
+                    "name": "OldName",
+                    "screen_name": "old_handle",
+                    "profile_image_url_https": "https://example.com/old.jpg",
+                    "description": "old bio",
+                },
+            }
+        )
+
+        assert user is not None
+        assert user.name == "NewName"
+        assert user.screen_name == "new_handle"
+        assert user.profile_image_url == "https://example.com/new.jpg"
+        # bio still comes from legacy — it hasn't migrated
+        assert user.bio == "old bio"
+
+    def test_falls_back_to_legacy_when_core_missing(self):
+        """Older response shape with only legacy{} — keep working."""
+        user = parse_user_result(
+            {
+                "rest_id": "user-4",
+                "legacy": {
+                    "name": "Carol",
+                    "screen_name": "carol",
+                    "profile_image_url_https": "https://example.com/carol.jpg",
+                    "location": "Mars",
+                    "created_at": "Mon Jan 01 00:00:00 +0000 2020",
+                },
+            }
+        )
+
+        assert user is not None
+        assert user.name == "Carol"
+        assert user.screen_name == "carol"
+        assert user.profile_image_url == "https://example.com/carol.jpg"
+        assert user.location == "Mars"
+        assert user.created_at == "Mon Jan 01 00:00:00 +0000 2020"
+
+    def test_returns_none_without_rest_id(self):
+        """No rest_id means no user — drop the row instead of emitting an
+        empty-id UserProfile."""
+        assert parse_user_result({"core": {"name": "Anon"}}) is None
+        assert parse_user_result({}) is None
+
+    def test_returns_none_for_user_unavailable(self):
+        assert (
+            parse_user_result({"__typename": "UserUnavailable", "rest_id": "x"}) is None
+        )
+
 
 # ── upload_media ─────────────────────────────────────────────────────────
 
@@ -1389,3 +1547,161 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── ClientTransaction bootstrap ──────────────────────────────────────────
+
+# Minimal stand-ins for the two x.com web shells.  The authenticated
+# ``responsive-web/client-web`` shell embeds an ``ondemand.s`` webpack manifest
+# entry; the logged-out shell that x.com serves to anonymous requests does not.
+AUTHENTICATED_SHELL_HTML = (
+    '<html><head><meta name="twitter-site-verification" content="abc"/></head>'
+    '<body><script>window.__INITIAL_STATE__={};'
+    'e.p+"responsive-web/client-web/"+({0:"main",91:"ondemand.s"})[e]+"."+'
+    '({0:"deadbeef",91:"439805a8033e107c"})[e]+"a.js"</script></body></html>'
+)
+LOGGED_OUT_SHELL_HTML = (
+    '<html><head><meta name="twitter-site-verification" content="abc"/></head>'
+    '<body><script type="module" '
+    'src="https://abs.twimg.com/x-web/x-web/entry-client-logged-out-D_NqeUbh.js">'
+    "</script></body></html>"
+)
+
+
+def _bare_client(cookie_string=None):
+    """Build a TwitterClient without running its eager network bootstrap."""
+    client = TwitterClient.__new__(TwitterClient)
+    client._auth_token = "token"
+    client._ct0 = "ct0"
+    client._cookie_string = cookie_string
+    client._request_delay = 0.0
+    client._max_retries = 3
+    client._retry_base_delay = 5.0
+    client._max_count = 200
+    client._client_transaction = None
+    client._ct_init_attempted = False
+    return client
+
+
+class TestResolveOndemandFileUrl:
+    def test_resolves_url_from_authenticated_shell(self):
+        soup = bs4.BeautifulSoup(AUTHENTICATED_SHELL_HTML, "html.parser")
+
+        url = _resolve_ondemand_file_url(soup)
+
+        assert url == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.439805a8033e107ca.js"
+        )
+
+    def test_logged_out_shell_raises_actionable_error(self):
+        """The logged-out app has no webpack manifest.  Surface that, rather
+        than the library's bare "'NoneType' object has no attribute 'group'"."""
+        soup = bs4.BeautifulSoup(LOGGED_OUT_SHELL_HTML, "html.parser")
+
+        with pytest.raises(OndemandBundleNotFound) as excinfo:
+            _resolve_ondemand_file_url(soup)
+
+        assert "ondemand.s" in str(excinfo.value)
+        assert "authenticated" in str(excinfo.value)
+
+
+class TestEnsureClientTransaction:
+    """x.com serves the ondemand.s-bearing web shell only to authenticated
+    requests, so the bootstrap fetch has to carry the session cookies."""
+
+    @staticmethod
+    def _run_bootstrap(client):
+        session = MagicMock()
+        requests = []
+
+        def _get(url, headers=None, timeout=None):
+            requests.append((url, headers or {}))
+            response = MagicMock()
+            if url == "https://x.com":
+                response.content = AUTHENTICATED_SHELL_HTML.encode("utf-8")
+                response.text = AUTHENTICATED_SHELL_HTML
+            else:
+                response.content = b"ondemand"
+                response.text = "ondemand"
+            return response
+
+        session.get = _get
+
+        with patch("twitter_cli.client._get_cffi_session", return_value=session), patch(
+            "twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"}
+        ), patch("twitter_cli.client.ClientTransaction") as mock_ct, patch.object(
+            TwitterClient, "_load_ct_cache", return_value=False
+        ), patch.object(TwitterClient, "_save_ct_cache"):
+            client._ensure_client_transaction()
+
+        return requests, mock_ct
+
+    def test_homepage_fetch_sends_session_cookies(self):
+        client = _bare_client(cookie_string="auth_token=x; ct0=y; other=z")
+
+        requests, mock_ct = self._run_bootstrap(client)
+
+        homepage_url, homepage_headers = requests[0]
+        assert homepage_url == "https://x.com"
+        assert homepage_headers["Cookie"] == "auth_token=x; ct0=y; other=z"
+        # ct headers still applied alongside the cookie
+        assert homepage_headers["Referer"] == "https://x.com"
+        assert mock_ct.called
+
+    def test_homepage_fetch_falls_back_to_token_pair_cookie(self):
+        client = _bare_client(cookie_string=None)
+
+        requests, _ = self._run_bootstrap(client)
+
+        assert requests[0][1]["Cookie"] == "auth_token=token; ct0=ct0"
+
+    def test_cdn_fetch_does_not_leak_cookies(self):
+        client = _bare_client(cookie_string="auth_token=x; ct0=y")
+
+        requests, _ = self._run_bootstrap(client)
+
+        cdn_url, cdn_headers = requests[1]
+        assert cdn_url.startswith("https://abs.twimg.com/")
+        assert "Cookie" not in cdn_headers
+
+    def test_logged_out_shell_leaves_transaction_unset(self):
+        """Regression: this used to raise AttributeError deep in the library."""
+        client = _bare_client()
+        session = MagicMock()
+        response = MagicMock()
+        response.content = LOGGED_OUT_SHELL_HTML.encode("utf-8")
+        response.text = LOGGED_OUT_SHELL_HTML
+        session.get = MagicMock(return_value=response)
+
+        with patch("twitter_cli.client._get_cffi_session", return_value=session), patch(
+            "twitter_cli.client._gen_ct_headers", return_value={}
+        ), patch.object(TwitterClient, "_load_ct_cache", return_value=False):
+            client._ensure_client_transaction()
+
+        assert client._client_transaction is None
+
+
+class TestTransactionIdHeader:
+    def test_header_sent_when_transaction_available(self):
+        client = _bare_client()
+        client._ct_init_attempted = True
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-123"
+
+        headers = client._build_headers(
+            url="https://x.com/i/api/graphql/abc/SearchTimeline", method="POST"
+        )
+
+        assert headers["X-Client-Transaction-Id"] == "tid-123"
+        client._client_transaction.generate_transaction_id.assert_called_once_with(
+            method="POST", path="/i/api/graphql/abc/SearchTimeline"
+        )
+
+    def test_header_absent_when_transaction_unavailable(self):
+        client = _bare_client()
+        client._ct_init_attempted = True
+
+        headers = client._build_headers(url="https://x.com/i/api/graphql/abc/X", method="GET")
+
+        assert "X-Client-Transaction-Id" not in headers

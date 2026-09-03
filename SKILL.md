@@ -176,6 +176,7 @@ twitter article 1234567890 -o art.md   # Save to file
 twitter article https://x.com/i/article/1234567890  # Accepts /i/article/ URLs (resolves automatically)
 twitter article https://x.com/user/article/1234567890 --json  # Accepts user article URLs
 twitter list 1539453138322673664       # List timeline
+twitter list 1539453138322673664 --cursor "<next-cursor>"
 twitter list 1539453138322673664 --full-text
 twitter user-posts elonmusk --max 20   # User's tweets
 twitter user-posts elonmusk --full-text
