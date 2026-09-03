@@ -37,6 +37,7 @@ from .constants import (
 from .exceptions import (
     MediaUploadError,
     NotFoundError,
+    OndemandBundleNotFound,
     TwitterAPIError,
 )
 from .graphql import (
@@ -130,6 +131,27 @@ def _get_cffi_session():
         if proxy:
             logger.info("Using proxy: %s", proxy[:20] + "...")
     return _cffi_session
+
+
+def _resolve_ondemand_file_url(home_page_response):
+    # type: (Any) -> str
+    """Resolve the ``ondemand.s`` bundle URL from an x.com web-shell response.
+
+    ``get_ondemand_file_url`` regex-scrapes the webpack manifest and raises a
+    bare ``AttributeError`` ("'NoneType' object has no attribute 'group'") when
+    the manifest entry is absent, which says nothing useful in a log line.  X
+    only embeds that entry in the authenticated ``responsive-web/client-web``
+    shell — the logged-out homepage is now a separate lightweight app with no
+    webpack manifest at all — so a miss means we were served the wrong shell.
+    """
+    try:
+        return get_ondemand_file_url(response=home_page_response)
+    except AttributeError:
+        raise OndemandBundleNotFound(
+            "x.com response contains no ondemand.s bundle reference; the "
+            "homepage fetch must be authenticated to receive the "
+            "responsive-web web shell that embeds it"
+        )
 
 
 def _url_fetch(url, headers=None):
@@ -1203,6 +1225,13 @@ class TwitterClient:
 
     # ── Internal: Anti-detection / headers ───────────────────────────
 
+    def _cookie_header(self):
+        # type: () -> str
+        """Return the Cookie header value for authenticated x.com requests."""
+        if self._cookie_string:
+            return self._cookie_string
+        return "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0)
+
     @staticmethod
     def _ct_cache_path():
         # type: () -> str
@@ -1244,13 +1273,16 @@ class TwitterClient:
         try:
             cache_path = self._ct_cache_path()
             cache_dir = os.path.dirname(cache_path)
-            os.makedirs(cache_dir, exist_ok=True)
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
             cache = {
                 "home_html": home_html,
                 "ondemand_text": ondemand_text,
                 "created_at": time.time(),
             }
-            with open(cache_path, "w", encoding="utf-8") as f:
+            # home_html is the *authenticated* web shell and embeds the signed-in
+            # account's own profile data, so keep the cache owner-readable only.
+            fd = os.open(cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(cache, f)
             logger.debug("Saved CT cache to %s", cache_path)
         except Exception as exc:
@@ -1277,13 +1309,18 @@ class TwitterClient:
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            # The homepage fetch must carry the session cookies.  Anonymous
+            # requests to x.com now get a lightweight logged-out app that has
+            # no webpack manifest, so the ondemand.s bundle — the source of
+            # the KEY_BYTE indices — cannot be located from it.
             home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
+                "https://x.com",
+                headers=dict(ct_headers, Cookie=self._cookie_header()),
+                timeout=10,
             )
             home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
-            ondemand_url = get_ondemand_file_url(response=home_page_response)
-            if not ondemand_url:
-                raise ValueError("Failed to extract ondemand file URL from homepage")
+            ondemand_url = _resolve_ondemand_file_url(home_page_response)
+            # abs.twimg.com is a plain CDN; do not hand it session cookies.
             ondemand_file = cffi_session.get(
                 ondemand_url, headers=ct_headers, timeout=10,
             )
@@ -1306,7 +1343,7 @@ class TwitterClient:
         """Build shared headers for authenticated API calls."""
         headers = {
             "Authorization": "Bearer %s" % BEARER_TOKEN,
-            "Cookie": self._cookie_string or "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0),
+            "Cookie": self._cookie_header(),
             "X-Csrf-Token": self._ct0,
             "X-Twitter-Active-User": "yes",
             "X-Twitter-Auth-Type": "OAuth2Session",

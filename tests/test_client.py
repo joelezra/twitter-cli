@@ -6,6 +6,7 @@ and feature flag update logic — all without requiring network access.
 
 from __future__ import annotations
 
+import bs4
 import copy
 from unittest.mock import MagicMock, patch
 
@@ -14,9 +15,10 @@ import pytest
 
 from twitter_cli.client import (
     _best_chrome_target,
+    _resolve_ondemand_file_url,
     TwitterClient,
 )
-from twitter_cli.exceptions import TwitterAPIError
+from twitter_cli.exceptions import OndemandBundleNotFound, TwitterAPIError
 from twitter_cli.graphql import (
     FEATURES,
     FALLBACK_QUERY_IDS,
@@ -1545,3 +1547,161 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── ClientTransaction bootstrap ──────────────────────────────────────────
+
+# Minimal stand-ins for the two x.com web shells.  The authenticated
+# ``responsive-web/client-web`` shell embeds an ``ondemand.s`` webpack manifest
+# entry; the logged-out shell that x.com serves to anonymous requests does not.
+AUTHENTICATED_SHELL_HTML = (
+    '<html><head><meta name="twitter-site-verification" content="abc"/></head>'
+    '<body><script>window.__INITIAL_STATE__={};'
+    'e.p+"responsive-web/client-web/"+({0:"main",91:"ondemand.s"})[e]+"."+'
+    '({0:"deadbeef",91:"439805a8033e107c"})[e]+"a.js"</script></body></html>'
+)
+LOGGED_OUT_SHELL_HTML = (
+    '<html><head><meta name="twitter-site-verification" content="abc"/></head>'
+    '<body><script type="module" '
+    'src="https://abs.twimg.com/x-web/x-web/entry-client-logged-out-D_NqeUbh.js">'
+    "</script></body></html>"
+)
+
+
+def _bare_client(cookie_string=None):
+    """Build a TwitterClient without running its eager network bootstrap."""
+    client = TwitterClient.__new__(TwitterClient)
+    client._auth_token = "token"
+    client._ct0 = "ct0"
+    client._cookie_string = cookie_string
+    client._request_delay = 0.0
+    client._max_retries = 3
+    client._retry_base_delay = 5.0
+    client._max_count = 200
+    client._client_transaction = None
+    client._ct_init_attempted = False
+    return client
+
+
+class TestResolveOndemandFileUrl:
+    def test_resolves_url_from_authenticated_shell(self):
+        soup = bs4.BeautifulSoup(AUTHENTICATED_SHELL_HTML, "html.parser")
+
+        url = _resolve_ondemand_file_url(soup)
+
+        assert url == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.439805a8033e107ca.js"
+        )
+
+    def test_logged_out_shell_raises_actionable_error(self):
+        """The logged-out app has no webpack manifest.  Surface that, rather
+        than the library's bare "'NoneType' object has no attribute 'group'"."""
+        soup = bs4.BeautifulSoup(LOGGED_OUT_SHELL_HTML, "html.parser")
+
+        with pytest.raises(OndemandBundleNotFound) as excinfo:
+            _resolve_ondemand_file_url(soup)
+
+        assert "ondemand.s" in str(excinfo.value)
+        assert "authenticated" in str(excinfo.value)
+
+
+class TestEnsureClientTransaction:
+    """x.com serves the ondemand.s-bearing web shell only to authenticated
+    requests, so the bootstrap fetch has to carry the session cookies."""
+
+    @staticmethod
+    def _run_bootstrap(client):
+        session = MagicMock()
+        requests = []
+
+        def _get(url, headers=None, timeout=None):
+            requests.append((url, headers or {}))
+            response = MagicMock()
+            if url == "https://x.com":
+                response.content = AUTHENTICATED_SHELL_HTML.encode("utf-8")
+                response.text = AUTHENTICATED_SHELL_HTML
+            else:
+                response.content = b"ondemand"
+                response.text = "ondemand"
+            return response
+
+        session.get = _get
+
+        with patch("twitter_cli.client._get_cffi_session", return_value=session), patch(
+            "twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"}
+        ), patch("twitter_cli.client.ClientTransaction") as mock_ct, patch.object(
+            TwitterClient, "_load_ct_cache", return_value=False
+        ), patch.object(TwitterClient, "_save_ct_cache"):
+            client._ensure_client_transaction()
+
+        return requests, mock_ct
+
+    def test_homepage_fetch_sends_session_cookies(self):
+        client = _bare_client(cookie_string="auth_token=x; ct0=y; other=z")
+
+        requests, mock_ct = self._run_bootstrap(client)
+
+        homepage_url, homepage_headers = requests[0]
+        assert homepage_url == "https://x.com"
+        assert homepage_headers["Cookie"] == "auth_token=x; ct0=y; other=z"
+        # ct headers still applied alongside the cookie
+        assert homepage_headers["Referer"] == "https://x.com"
+        assert mock_ct.called
+
+    def test_homepage_fetch_falls_back_to_token_pair_cookie(self):
+        client = _bare_client(cookie_string=None)
+
+        requests, _ = self._run_bootstrap(client)
+
+        assert requests[0][1]["Cookie"] == "auth_token=token; ct0=ct0"
+
+    def test_cdn_fetch_does_not_leak_cookies(self):
+        client = _bare_client(cookie_string="auth_token=x; ct0=y")
+
+        requests, _ = self._run_bootstrap(client)
+
+        cdn_url, cdn_headers = requests[1]
+        assert cdn_url.startswith("https://abs.twimg.com/")
+        assert "Cookie" not in cdn_headers
+
+    def test_logged_out_shell_leaves_transaction_unset(self):
+        """Regression: this used to raise AttributeError deep in the library."""
+        client = _bare_client()
+        session = MagicMock()
+        response = MagicMock()
+        response.content = LOGGED_OUT_SHELL_HTML.encode("utf-8")
+        response.text = LOGGED_OUT_SHELL_HTML
+        session.get = MagicMock(return_value=response)
+
+        with patch("twitter_cli.client._get_cffi_session", return_value=session), patch(
+            "twitter_cli.client._gen_ct_headers", return_value={}
+        ), patch.object(TwitterClient, "_load_ct_cache", return_value=False):
+            client._ensure_client_transaction()
+
+        assert client._client_transaction is None
+
+
+class TestTransactionIdHeader:
+    def test_header_sent_when_transaction_available(self):
+        client = _bare_client()
+        client._ct_init_attempted = True
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-123"
+
+        headers = client._build_headers(
+            url="https://x.com/i/api/graphql/abc/SearchTimeline", method="POST"
+        )
+
+        assert headers["X-Client-Transaction-Id"] == "tid-123"
+        client._client_transaction.generate_transaction_id.assert_called_once_with(
+            method="POST", path="/i/api/graphql/abc/SearchTimeline"
+        )
+
+    def test_header_absent_when_transaction_unavailable(self):
+        client = _bare_client()
+        client._ct_init_attempted = True
+
+        headers = client._build_headers(url="https://x.com/i/api/graphql/abc/X", method="GET")
+
+        assert "X-Client-Transaction-Id" not in headers

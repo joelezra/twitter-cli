@@ -83,3 +83,44 @@ class TestReadOnly:
         result, payload = _invoke("feed", "--max", "3")
         assert result.exit_code == 0, f"feed failed: {result.output}"
         assert payload["ok"] is True
+
+    def test_search_with_filters(self):
+        result, payload = _invoke(
+            "search", "python", "--lang", "en", "--min-likes", "5", "--max", "3"
+        )
+        assert result.exit_code == 0, f"advanced search failed: {result.output}"
+        assert payload["ok"] is True
+        items = payload["data"]
+        assert isinstance(items, list)
+        assert len(items) >= 1
+
+
+# ── Anti-detection bootstrap ────────────────────────────────────────────
+
+
+@smoke
+class TestClientTransaction:
+    """x.com only embeds the ondemand.s bundle reference in the authenticated
+    web shell.  When X reshapes that shell again, this fails here rather than
+    silently dropping the x-client-transaction-id header in production.
+    """
+
+    def test_transaction_id_header_is_generated(self):
+        from twitter_cli import auth
+        from twitter_cli.client import TwitterClient
+
+        cookies = auth.get_cookies()
+        client = TwitterClient(
+            cookies["auth_token"],
+            cookies["ct0"],
+            cookie_string=cookies.get("cookie_string"),
+        )
+
+        assert client._client_transaction is not None, (
+            "ClientTransaction failed to bootstrap against the live x.com web shell"
+        )
+
+        headers = client._build_headers(
+            url="https://x.com/i/api/graphql/abc/SearchTimeline", method="POST"
+        )
+        assert headers.get("X-Client-Transaction-Id")
