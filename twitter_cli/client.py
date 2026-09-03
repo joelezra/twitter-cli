@@ -50,11 +50,14 @@ from .graphql import (
 )
 from .models import (
     BookmarkFolder,
+    UserProfile,
+)
+
+# Referenced only from `# type:` comments, which ruff does not parse but mypy does.
+from .models import (  # noqa: F401
     DMConversation,
     DMMessage,
-    DMParticipant,
     Trend,
-    UserProfile,
 )
 from .parser import (
     _deep_get,
