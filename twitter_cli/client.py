@@ -164,22 +164,28 @@ class TwitterClient:
 
     # ── Read operations ──────────────────────────────────────────────
 
-    def fetch_home_timeline(self, count=20):
-        # type: (int) -> List[Tweet]
+    def fetch_home_timeline(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
+        # type: (int, bool, Optional[str], bool) -> Any
         """Fetch home timeline tweets."""
         return self._fetch_timeline(
             "HomeTimeline",
             count,
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
+            include_promoted=include_promoted,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
-    def fetch_following_feed(self, count=20):
-        # type: (int) -> List[Tweet]
+    def fetch_following_feed(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
+        # type: (int, bool, Optional[str], bool) -> Any
         """Fetch chronological following feed."""
         return self._fetch_timeline(
             "HomeLatestTimeline",
             count,
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
+            include_promoted=include_promoted,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
     def fetch_bookmarks(self, count=50):
@@ -285,20 +291,23 @@ class TwitterClient:
             raise NotFoundError("User @%s not found" % screen_name)
 
         legacy = result.get("legacy", {})
+        core = result.get("core", {})
+        avatar = result.get("avatar", {})
+        location_obj = result.get("location", {})
         return UserProfile(
             id=result.get("rest_id", ""),
-            name=legacy.get("name", ""),
-            screen_name=legacy.get("screen_name", screen_name),
+            name=core.get("name") or legacy.get("name", ""),
+            screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
             bio=legacy.get("description", ""),
-            location=legacy.get("location", ""),
+            location=location_obj.get("location") or legacy.get("location", ""),
             url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
             followers_count=_parse_int(legacy.get("followers_count"), 0),
             following_count=_parse_int(legacy.get("friends_count"), 0),
             tweets_count=_parse_int(legacy.get("statuses_count"), 0),
             likes_count=_parse_int(legacy.get("favourites_count"), 0),
             verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
-            profile_image_url=legacy.get("profile_image_url_https", ""),
-            created_at=legacy.get("created_at", ""),
+            profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
+            created_at=core.get("created_at") or legacy.get("created_at", ""),
         )
 
     def fetch_user_tweets(self, user_id, count=20):
@@ -464,8 +473,8 @@ class TwitterClient:
         logger.info("fetch_article: tweet_id=%s", tweet_id)
         return tweet
 
-    def fetch_list_timeline(self, list_id, count=20):
-        # type: (str, int) -> List[Tweet]
+    def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
+        # type: (str, int, Optional[str], bool) -> Any
         """Fetch tweets from a Twitter List."""
         return self._fetch_timeline(
             "ListLatestTweetsTimeline",
@@ -473,6 +482,8 @@ class TwitterClient:
             lambda data: _deep_get(data, "data", "list", "tweets_timeline", "timeline", "instructions"),
             extra_variables={"listId": list_id},
             override_base_variables=True,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
 
     def fetch_followers(self, user_id, count=20):
@@ -481,6 +492,7 @@ class TwitterClient:
         return self._fetch_user_list(
             "Followers", user_id, count,
             lambda data: _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions"),
+            use_post=True,
         )
 
     def fetch_following(self, user_id, count=20):
@@ -489,6 +501,7 @@ class TwitterClient:
         return self._fetch_user_list(
             "Following", user_id, count,
             lambda data: _deep_get(data, "data", "user", "result", "timeline", "timeline", "instructions"),
+            use_post=True,
         )
 
     # ── Trends ───────────────────────────────────────────────────────
@@ -910,8 +923,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool) -> List[Tweet]
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -929,7 +942,8 @@ class TwitterClient:
 
         tweets = []  # type: List[Tweet]
         seen_ids = set()  # type: Set[str]
-        cursor = None  # type: Optional[str]
+        cursor = start_cursor  # type: Optional[str]
+        continuation_cursor = None  # type: Optional[str]
         attempts = 0
         max_attempts = int(math.ceil(count / 20.0)) + 2
 
@@ -941,7 +955,7 @@ class TwitterClient:
             else:
                 variables = {
                     "count": min(count - len(tweets) + 5, 40),
-                    "includePromotedContent": False,
+                    "includePromotedContent": include_promoted,
                     "latestControlAvailable": True,
                     "requestContext": "launch",
                 }
@@ -962,10 +976,13 @@ class TwitterClient:
                     tweets.append(tweet)
 
             if not next_cursor:
+                continuation_cursor = None
                 break
             if next_cursor == cursor:
                 logger.debug("Timeline pagination stopped because cursor did not advance: %s", next_cursor)
+                continuation_cursor = None
                 break
+            continuation_cursor = next_cursor
             cursor = next_cursor
 
             if not new_tweets:
@@ -977,10 +994,12 @@ class TwitterClient:
                 logger.debug("Sleeping %.1fs between requests", jitter)
                 time.sleep(jitter)
 
+        if return_cursor:
+            return tweets[:count], continuation_cursor
         return tweets[:count]
 
-    def _fetch_user_list(self, operation_name, user_id, count, get_instructions):
-        # type: (str, str, int, Callable[[Any], Any]) -> List[UserProfile]
+    def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
+        # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
         """Generic user list fetcher (for followers/following) with pagination."""
         if count <= 0:
             return []
@@ -1001,7 +1020,10 @@ class TwitterClient:
             if cursor:
                 variables["cursor"] = cursor
 
-            data = self._graphql_get(operation_name, variables, FEATURES)
+            if use_post:
+                data = self._graphql_post(operation_name, variables, FEATURES)
+            else:
+                data = self._graphql_get(operation_name, variables, FEATURES)
             instructions = get_instructions(data)
             if not instructions:
                 logger.warning("No user list instructions found")
